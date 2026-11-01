@@ -7,18 +7,32 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 )
 
-type Movie struct {
+type movie struct {
 	id       int
 	title    string
 	year     int
 	director string
 }
 
-func (mov *Movie) mOutput(){
+func (mov *movie) mOutput(){
 	fmt.Println("%d — %s — %d — %s", mov.id, mov.title, mov.year, mov.director)
+}
+
+type flags struct{
+	from int
+	to int
+	workers int
+	timeout time.Duration
+}
+
+type result struct{
+	id int
+	mv movie
+	err error
 }
 
 func main() int{
@@ -26,7 +40,7 @@ func main() int{
 	fromPtr  := flag.Int("from", -1, "mandatory index flag of the first movie")
 	toPtr := flag.Int("to", -1, "mandatory index flag of the last movie")
 	workersPtr := flag.Int("workers", 10, "number of workers")
-	timeout := flag.Duration("timeout", 5*time.Second, "timeout of a single HTTP request")
+	timeoutPtr := flag.Duration("timeout", 5*time.Second, "timeout of a single HTTP request")
 
 	flag.Parse()
 	
@@ -59,32 +73,76 @@ func main() int{
 		return 2
 	}
 
-
+	cfg := flags{
+		from: *fromPtr,
+		to: *toPtr,
+		workers: *workersPtr,
+		timeout: *timeoutPtr,
+	}
 }
 
-func fetchMovie(ctx context.Context, id int, client http.Client) (Movie, error) {
+func fetchMovie(ctx context.Context, id int, client *http.Client) (movie, error) {
 	url := fmt.Sprintf("https://homeworksite.site/%d/info.0.json", id)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return Movie{}, fmt.Errorf("movie: %d, error: %w", id, err)
+		return movie{}, fmt.Errorf("movie: %d, error: %w", id, err)
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return Movie{}, fmt.Errorf("movie: %d, error: %w", id, err)
+		return movie{}, fmt.Errorf("movie: %d, error: %w", id, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return Movie{}, fmt.Errorf("movie: %d, HTTP STATUS: %d", id, resp.StatusCode)
+		return movie{}, fmt.Errorf("movie: %d, HTTP STATUS: %d", id, resp.StatusCode)
 	}
 
-	var m = Movie{}
+	var m = movie{}
 	err = json.NewDecoder(resp.Body).Decode(&m)
 	if err != nil{
-		return Movie{}, fmt.Errorf("movie: %d, invalid JSON: %d", err)
+		return movie{}, fmt.Errorf("movie: %d, invalid JSON: %w", err)
 	}
 
 	return m, nil
+}
+
+func run(ctx context.Context, flgs flags){
+	client := &http.Client{Timeout: flgs.timeout}
+
+	jobs := make(chan int)
+	results := make(chan result)
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < flgs.workers; i++{
+		wg.Add(1)
+		go func(){
+			defer wg.Done()
+			for id := range jobs {
+				m, err := fetchMovie(ctx, id, client)
+				results <- result{id, m, err}
+			}
+		}()
+	}
+
+	go func(){
+		defer close(jobs)
+		for id := flgs.from; id <= flgs.to; id++{
+			jobs <- id
+		}
+	}()
+
+	go func(){
+		wg.Wait()
+		close(results)
+	}()
+
+	for r := range results{
+		if r.err != nil{
+			fmt.Fprintf(os.Stderr, "%w", r.err)
+		}
+		r.mv.mOutput()
+	}
 }
